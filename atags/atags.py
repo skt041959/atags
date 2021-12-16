@@ -13,14 +13,25 @@ import sys
 from aiomultiprocess import Pool
 import pygments.lexers
 from pygments.token import Token
+from atags.profile import profileit
 
 logging.basicConfig(
     filename=Path.home() / '.cache/tags.log',
     filemode='a',
-    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-    datefmt='%H:%M:%S',
+    format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+    datefmt='%m-%d %H:%M',
     level=logging.DEBUG,
 )
+# define a Handler which writes INFO messages or higher to the sys.stderr
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+# set a format which is simpler for console use
+formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
+# tell the handler to use this format
+console.setFormatter(formatter)
+# add the handler to the root logger
+logging.getLogger('').addHandler(console)
+
 
 LANGUAGE_ALIASES = {
     'fantom': 'fan',
@@ -118,16 +129,20 @@ class CtagsParser:
     TERMINATOR = '###terminator###\n'
     CLOSEFDS = sys.platform != 'win32'
 
-    def __init__(self, ctags_command):
+    def __init__(self, ctags_command, output_format):
+        self.command = ctags_command
+        self.format = output_format
+
+    def __enter__(self):
         import subprocess
 
         self.process = subprocess.Popen(
             [
-                ctags_command,
+                self.command,
                 '-xu',
                 '--filter',
                 '--filter-terminator=' + self.TERMINATOR,
-                '--format=1',
+                '--format={}'.format(self.format),
             ],
             bufsize=-1,
             stdin=subprocess.PIPE,
@@ -140,7 +155,13 @@ class CtagsParser:
         #  self.child_stdout = io.TextIOWrapper(self.process.stdout.buffer, encoding='latin1')
         self.child_stdout = self.process.stdout
         self.child_stdin = self.process.stdin
-        logging.debug("launched ctags %s", ctags_command)
+        logging.debug("launched ctags %s", self.command)
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.process.terminate()
+        self.process.wait()
 
     def parse(self, file_map):
         results = {}
@@ -150,6 +171,7 @@ class CtagsParser:
             values = []
             results[fileid] = values
             pattern = re.compile(r'(\S+)\s+(\d+)\s+' + re.escape(path) + r'\s+(.*)$')
+            #  pattern = re.compile(r'(\S+)\s+(\S+)\s+(\d+)\s+' + re.escape(path) + r'\s+(.*)$')
             while True:
                 line = self.child_stdout.readline()
                 if not line or line.startswith(self.TERMINATOR):
@@ -165,82 +187,93 @@ def find_files():
     return []
 
 
-def build_path_db(dbpath, files, args):
+def build_path_db(cnx, files, args):
     #  from IPython.core.debugger import set_trace; set_trace()
-    with sqlite3.connect(dbpath) as cnx:
+    from time import time
+
+    current = time()  # TODO
+
+    if not args.incremental:
+        #  cnx.execute(
+        #      '''create table if not exists timeindexed (time);
+        #      insert into timeindexed values (?) ''',
+        #      (current,),
+        #  )
         cnx.execute(
             '''create table if not exists path
                     (file text, mtime int, fileid int primary key)'''
         )
-        if not args.incremental:
-            file_map = {file: (int(os.path.getmtime(file)), id) for id, file in enumerate(files)}
-            cnx.executemany(
-                'insert into path values (?,?,?)',
-                ((file, mtime, id) for file, (mtime, id) in file_map.items()),
+        file_map = {file: (int(os.path.getmtime(file)), id) for id, file in enumerate(files)}
+        logging.info("%d files", len(file_map))
+        cnx.executemany(
+            'insert into path values (?,?,?)',
+            ((file, mtime, id) for file, (mtime, id) in file_map.items()),
+        )
+        cnx.execute('create unique index if not exists file_index on path(file)')
+        return file_map, []
+    else:
+        maxid = cnx.execute('select max(fileid) from path').fetchone()[0]
+        maxid = 0 if maxid is None else maxid
+        file_map = {
+            value[0]: (value[1], value[2]) for value in cnx.execute('select * from path').fetchall()
+        }
+
+        deleted_files = {}
+        for file, (mtime, id) in file_map.items():
+            if not os.path.isfile(file):
+                deleted_files[file] = file_map.pop(file)
+        if deleted_files:
+            cnx.executemany('delete from path where id=?', deleted_files)
+            logging.info("%d deleted files", len(deleted_files))
+
+        new_files = {
+            file: (int(os.path.getmtime(file)), id)
+            for id, file in enumerate(
+                (file for file in files if file not in file_map), start=maxid + 1
             )
-            return file_map, []
-        else:
-            maxid = cnx.execute('select max(fileid) from path').fetchone()[0]
-            maxid = 0 if maxid is None else maxid
-            file_map = {
-                value[0]: (value[1], value[2])
-                for value in cnx.execute('select * from path').fetchall()
-            }
-            deleted_files = {}
-            for file, (mtime, id) in file_map.items():
-                if not os.path.isfile(file):
-                    deleted_files[file] = file_map.pop(file)
-            new_files = {
-                file: (int(os.path.getmtime(file)), id)
-                for id, file in enumerate(
-                    (file for file in files if file not in file_map), start=maxid + 1
-                )
-            }
-            for file, (mtime, id) in file_map.items():
-                new_mtime = int(os.path.getmtime(file))
-                if new_mtime > mtime:
-                    new_files[file] = (new_mtime, id)
-            if deleted_files:
-                cnx.executemany('delete from path where id=?', deleted_files)
-            cnx.executemany(
-                'replace into path values (?,?,?)',
-                ((file, mtime, id) for file, (mtime, id) in new_files.items()),
-            )
-            return new_files, deleted_files
+        }
+        logging.info("%d new files", len(new_files))
+        for file, (mtime, id) in file_map.items():
+            new_mtime = int(os.path.getmtime(file))
+            if new_mtime > mtime:
+                new_files[file] = (new_mtime, id)
+        logging.info("%d modified files", len(new_files))
+        cnx.executemany(
+            'replace into path values (?,?,?)',
+            ((file, mtime, id) for file, (mtime, id) in new_files.items()),
+        )
+        return new_files, deleted_files
 
 
-async def build_reference_db(dbpath, langmap, new_file_map, deleted_file_map, args):
+async def build_reference_db(cnx, langmap, new_file_map, deleted_file_map, args):
     pygments_parser = PygmentsParser(langmap)
 
-    with sqlite3.connect(dbpath) as cnx:
-        cnx.execute(
-            '''create table if not exists ref
-                    (tag text, lineno int, fileid int)'''
+    cnx.execute(
+        '''create table if not exists ref
+                (tag text, lineno int, fileid int)'''
+    )
+    if args.incremental:
+        cnx.execute('drop index if exists ref_tag_index')
+        cnx.executemany(
+            'delete from ref where fileid=?',
+            [(id,) for file, (mtime, id) in chain(new_file_map.items(), deleted_file_map.items())],
         )
-        if args.incremental:
-            cnx.executemany(
-                'delete from ref where fileid=?',
-                (
-                    (id,)
-                    for file, (mtime, id) in chain(new_file_map.items(), deleted_file_map.items())
-                ),
-            )
-        if len(new_file_map) > args.num_jobs:
-            async with Pool(args.num_jobs) as pool:
-                async for id, values in pool.map(pygments_parser.parse, new_file_map.items()):
-                    cnx.executemany("insert into ref values (?,?,?)", values)
-                    logging.debug("finished %d", id)
-        else:
-            for item in new_file_map.items():
-                id, values = await pygments_parser.parse(item)
+    if len(new_file_map) > args.num_jobs:
+        async with Pool(args.num_jobs) as pool:
+            async for id, values in pool.map(pygments_parser.parse, new_file_map.items()):
                 cnx.executemany("insert into ref values (?,?,?)", values)
                 logging.debug("finished %d", id)
+    else:
+        for item in new_file_map.items():
+            id, values = await pygments_parser.parse(item)
+            cnx.executemany("insert into ref values (?,?,?)", values)
+            logging.debug("finished %d", id)
+    cnx.execute('create index if not exists ref_tag_index on ref(tag)')
+    cnx.execute('create index if not exists ref_file_index on ref(fileid)')
 
 
-async def build_definition_db(dbpath, langmap, new_file_map, deleted_file_map, args):
-    ctags_parser = CtagsParser('ctags')
-
-    with sqlite3.connect(dbpath) as cnx:
+async def build_definition_db(cnx, langmap, new_file_map, deleted_file_map, args):
+    with CtagsParser('ctags', 1) as parser:
         cnx.execute(
             '''create table if not exists def
                     (tag text, fileid int, lineno int, image text)'''
@@ -253,12 +286,13 @@ async def build_definition_db(dbpath, langmap, new_file_map, deleted_file_map, a
                     for file, (mtime, id) in chain(new_file_map.items(), deleted_file_map.items())
                 ),
             )
-        results = ctags_parser.parse(new_file_map)
+        results = parser.parse(new_file_map)
         for id, values in results.items():
             cnx.executemany("insert into def values (?,?,?,?)", values)
             logging.debug("finished %d", id)
 
 
+@profileit
 def tags_index(args):
     dbpath = Path(args.dbpath) / 'tags.db'
 
@@ -277,14 +311,23 @@ def tags_index(args):
         dbpath.unlink()
 
     dbpath = dbpath.as_posix()
-    new_file_map, deleted_file_map = build_path_db(dbpath, files, args)
-    logging.debug("new %s", new_file_map)
-    logging.debug("deleted %s", deleted_file_map)
+    with sqlite3.connect(dbpath) as cnx:
+        cnx.execute("PRAGMA temp_store = MEMORY")
+        cnx.execute('PRAGMA synchronous = 0')
 
-    asyncio.run(build_definition_db(dbpath, args.langmap, new_file_map, deleted_file_map, args))
-    asyncio.run(build_reference_db(dbpath, args.langmap, new_file_map, deleted_file_map, args))
+        new_file_map, deleted_file_map = build_path_db(cnx, files, args)
+
+        asyncio.run(
+            build_definition_db(cnx, args.langmap, new_file_map, deleted_file_map, args)
+        )
+        logging.info('done index definition')
+        asyncio.run(  #
+            build_reference_db(cnx, args.langmap, new_file_map, deleted_file_map, args)
+        )
+        logging.info('done index reference')
 
 
+@profileit
 def tags_query(args):
     dbpath = Path(args.dbpath) / 'tags.db'
 
@@ -305,6 +348,13 @@ def tags_query(args):
                 where path.file=:pattern and def.fileid = path.fileid''',
                 {"pattern": args.pattern},
             ).fetchall()
+        elif args.file_token:
+            results = cnx.execute(
+                '''select ref.tag,ref.lineno
+                from path,ref
+                where path.file=:pattern and ref.fileid = path.fileid''',
+                {"pattern": args.pattern},
+            ).fetchall()
         else:
             results = cnx.execute(
                 '''select path.file,def.lineno,def.image
@@ -312,44 +362,41 @@ def tags_query(args):
                 where def.tag=:pattern and path.fileid=def.fileid''',
                 {"pattern": args.pattern},
             ).fetchall()
-    print(results)
+    import pprint
+
+    pprint.pprint(results)
 
 
 def main():
     import argparse
-    import cProfile
 
-    class LangmapAction(argparse.Action):
-        def __call__(self, parser, namespace, values, option_string=None):
-            setattr(namespace, self.dest, self.parse_langmap(values))
-
-        def parse_langmap(self, string):
-            langmap = {}
-            if not string:
-                return langmap
-
-            mappings = string.split(',')
-            for mapping in mappings:
-                lang, exts = mapping.split(':')
-                if not lang[0].islower():  # skip lowercase, that is for builtin parser
-                    for ext in exts.split('.'):
-                        if ext:
-                            if sys.platform == 'win32':
-                                langmap['.' + ext.lower()] = lang
-                            else:
-                                langmap['.' + ext] = lang
+    def parse_langmap(string):
+        langmap = {}
+        if not string:
             return langmap
+
+        mappings = string.split(',')
+        for mapping in mappings:
+            lang, exts = mapping.split(':')
+            if not lang[0].islower():  # skip lowercase, that is for builtin parser
+                for ext in exts.split('.'):
+                    if ext:
+                        if sys.platform == 'win32':
+                            langmap['.' + ext.lower()] = lang
+                        else:
+                            langmap['.' + ext] = lang
+        return langmap
 
     root_arg = argparse.ArgumentParser()
     root_arg.add_argument('--dbpath', default='.')
-    root_arg.add_argument('--langmap', type=str, default='', action=LangmapAction)
-    root_arg.add_argument('--statistics', action='store_true')
+    root_arg.add_argument('--langmap', type=parse_langmap, default={})
+    root_arg.add_argument('-s', '--statistics', action='store_true')
 
     sub_parser = root_arg.add_subparsers(dest='command')
 
     index_parser = sub_parser.add_parser('index')
     index_parser.add_argument('-i', '--incremental', action='store_true')
-    index_parser.add_argument('--single_update', type=str)
+    index_parser.add_argument('-u', '--single_update', type=str)
     index_parser.add_argument('-j', dest='num_jobs', type=int, default=8)
 
     query_parser = sub_parser.add_parser('query')
@@ -361,13 +408,15 @@ def main():
     query_parser.add_argument(
         '-a', action='store_true', dest='context', help='query base on location'
     )
+    query_parser.add_argument('--file_token', action='store_true')
     query_parser.add_argument('pattern')
 
     args = root_arg.parse_args()
 
+    #  from IPython.core.debugger import set_trace; set_trace()
+
     if args.statistics:
-        pr = cProfile.Profile()
-        pr.enable()
+        profileit.enable_profile = True
 
     if args.command == 'index':
         tags_index(args)
@@ -375,10 +424,6 @@ def main():
         tags_query(args)
     else:
         root_arg.print_help()
-
-    if args.statistics:
-        pr.disable()
-        pr.print_stats(sort='tottime')
 
 
 if __name__ == "__main__":
